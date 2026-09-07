@@ -1,44 +1,23 @@
 """
-Simple shared JSON storage. Any cog can import `load_data` / `save_data`
-to persist its own data using its own top-level key, so cogs never
-clobber each other's data in the same file.
+Shared SQLite connection. Any cog can import get_connection() and create
+its own table(s) — one database file, but each cog owns its own schema,
+so cogs never collide with each other's data.
 """
 
-import json
 import os
+import sqlite3
 
-DATA_FILE = "bot_data.json"
+_VOLUME_DIR = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", ".")
+DB_FILE = os.path.join(_VOLUME_DIR, "bot.db")
 
-
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        return {}
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError):
-        return {}
+_connection = None
 
 
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-
-# One shared in-memory copy, loaded once at import time.
-DATA = load_data()
-
-
-def get_bucket(namespace: str, guild_id: int, default: dict):
-    """
-    Get (or create) a cog's private data bucket for a given guild.
-    `namespace` should be unique per cog, e.g. "sobs".
-    """
-    key = f"{namespace}:{guild_id}"
-    if key not in DATA:
-        DATA[key] = default
-    return DATA[key]
-
-
-def persist():
-    save_data(DATA)
+def get_connection() -> sqlite3.Connection:
+    global _connection
+    if _connection is None:
+        _connection = sqlite3.connect(DB_FILE, check_same_thread=False)
+        # WAL mode = readers don't block writers, better for a bot doing
+        # frequent small writes.
+        _connection.execute("PRAGMA journal_mode=WAL;")
+    return _connection

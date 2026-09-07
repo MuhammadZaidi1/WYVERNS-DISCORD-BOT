@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands
 
-from storage import get_bucket, persist
+from storage import get_connection
 
 SOB_EMOJI = "😭"
 
@@ -9,34 +9,92 @@ SOB_EMOJI = "😭"
 class Sobs(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.db = get_connection()
+        self.db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sob_messages (
+                guild_id    INTEGER NOT NULL,
+                message_id  INTEGER NOT NULL,
+                author_id   INTEGER NOT NULL,
+                channel_id  INTEGER NOT NULL,
+                count       INTEGER NOT NULL,
+                content     TEXT,
+                PRIMARY KEY (guild_id, message_id)
+            )
+            """
+        )
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sob_author ON sob_messages (guild_id, author_id)"
+        )
+        self.db.commit()
 
     # -- helpers -----------------------------------------------------
 
-    def _bucket(self, guild_id: int):
-        return get_bucket("sobs", guild_id, default={"members": {}, "messages": {}})
-
     def _adjust_count(self, guild_id, message_id, author_id, channel_id, delta, content=""):
-        bucket = self._bucket(guild_id)
-        mid = str(message_id)
-        aid = str(author_id)
+        cur = self.db.cursor()
+        cur.execute(
+            "SELECT count FROM sob_messages WHERE guild_id=? AND message_id=?",
+            (guild_id, message_id),
+        )
+        row = cur.fetchone()
 
-        entry = bucket["messages"].get(mid)
-        if entry is None:
-            entry = {"author_id": author_id, "channel_id": channel_id, "count": 0, "content": content}
-            bucket["messages"][mid] = entry
+        if row is None:
+            new_count = max(0, delta)
+            if new_count == 0:
+                return
+            cur.execute(
+                "INSERT INTO sob_messages (guild_id, message_id, author_id, channel_id, count, content) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (guild_id, message_id, author_id, channel_id, new_count, content),
+            )
+        else:
+            new_count = max(0, row[0] + delta)
+            if new_count == 0:
+                cur.execute(
+                    "DELETE FROM sob_messages WHERE guild_id=? AND message_id=?",
+                    (guild_id, message_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE sob_messages SET count=? WHERE guild_id=? AND message_id=?",
+                    (new_count, guild_id, message_id),
+                )
 
-        entry["count"] = max(0, entry["count"] + delta)
-        bucket["members"][aid] = max(0, bucket["members"].get(aid, 0) + delta)
+        self.db.commit()
 
-        if entry["count"] == 0:
-            del bucket["messages"][mid]
+    def _member_total(self, guild_id, author_id):
+        cur = self.db.cursor()
+        cur.execute(
+            "SELECT COALESCE(SUM(count), 0) FROM sob_messages WHERE guild_id=? AND author_id=?",
+            (guild_id, author_id),
+        )
+        return cur.fetchone()[0]
 
-        persist()
+    def _leaderboard(self, guild_id, limit=10):
+        cur = self.db.cursor()
+        cur.execute(
+            "SELECT author_id, SUM(count) AS total FROM sob_messages "
+            "WHERE guild_id=? GROUP BY author_id HAVING total > 0 "
+            "ORDER BY total DESC LIMIT ?",
+            (guild_id, limit),
+        )
+        return cur.fetchall()
+
+    def _top_messages(self, guild_id, author_id, limit=10):
+        cur = self.db.cursor()
+        cur.execute(
+            "SELECT message_id, channel_id, count, content FROM sob_messages "
+            "WHERE guild_id=? AND author_id=? ORDER BY count DESC LIMIT ?",
+            (guild_id, author_id, limit),
+        )
+        return cur.fetchall()
 
     async def _scan_guild(self, guild, status_callback=None):
-        bucket = self._bucket(guild.id)
-        bucket["members"] = {}
-        bucket["messages"] = {}
+        def _clear():
+            self.db.execute("DELETE FROM sob_messages WHERE guild_id=?", (guild.id,))
+            self.db.commit()
+
+        await self.bot.loop.run_in_executor(None, _clear)
 
         for channel in guild.text_channels:
             perms = channel.permissions_for(guild.me)
@@ -56,19 +114,20 @@ class Sobs(commands.Cog):
                         count = reaction.count
                         if count <= 0:
                             continue
-                        mid = str(message.id)
-                        bucket["messages"][mid] = {
-                            "author_id": message.author.id,
-                            "channel_id": channel.id,
-                            "count": count,
-                            "content": message.content[:100],
-                        }
-                        aid = str(message.author.id)
-                        bucket["members"][aid] = bucket["members"].get(aid, 0) + count
+
+                        def _insert(mid=message.id, aid=message.author.id, cid=channel.id,
+                                    c=count, content=message.content[:100]):
+                            self.db.execute(
+                                "INSERT OR REPLACE INTO sob_messages "
+                                "(guild_id, message_id, author_id, channel_id, count, content) "
+                                "VALUES (?, ?, ?, ?, ?, ?)",
+                                (guild.id, mid, aid, cid, c, content),
+                            )
+                            self.db.commit()
+
+                        await self.bot.loop.run_in_executor(None, _insert)
             except (discord.Forbidden, discord.HTTPException):
                 continue
-
-        persist()
 
     # -- events --------------------------------------------------------
 
@@ -100,10 +159,14 @@ class Sobs(commands.Cog):
         try:
             message = await channel.fetch_message(payload.message_id)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            bucket = self._bucket(payload.guild_id)
-            entry = bucket["messages"].get(str(payload.message_id))
-            if entry:
-                self._adjust_count(payload.guild_id, payload.message_id, entry["author_id"], payload.channel_id, -1)
+            cur = self.db.cursor()
+            cur.execute(
+                "SELECT author_id, channel_id FROM sob_messages WHERE guild_id=? AND message_id=?",
+                (payload.guild_id, payload.message_id),
+            )
+            row = cur.fetchone()
+            if row:
+                self._adjust_count(payload.guild_id, payload.message_id, row[0], row[1], -1)
             return
         if message.author.bot:
             return
@@ -114,8 +177,7 @@ class Sobs(commands.Cog):
     @commands.command(name="sobs")
     async def sobs(self, ctx, member: discord.Member = None):
         member = member or ctx.author
-        bucket = self._bucket(ctx.guild.id)
-        total = bucket["members"].get(str(member.id), 0)
+        total = self._member_total(ctx.guild.id, member.id)
 
         embed = discord.Embed(
             title="😭 Sob Counter",
@@ -138,10 +200,7 @@ class Sobs(commands.Cog):
 
     @sob.command(name="leaderboard")
     async def sob_leaderboard(self, ctx):
-        bucket = self._bucket(ctx.guild.id)
-        entries = [(mid, count) for mid, count in bucket["members"].items() if count > 0]
-        entries.sort(key=lambda x: x[1], reverse=True)
-        entries = entries[:25]
+        entries = self._leaderboard(ctx.guild.id)
 
         if not entries:
             await ctx.send("😭 Nobody has received any sob reactions yet! Try `,sob scan` if this seems wrong.")
@@ -150,7 +209,7 @@ class Sobs(commands.Cog):
         medals = ["🥇", "🥈", "🥉"]
         description = ""
         for position, (member_id, total) in enumerate(entries, start=1):
-            member = ctx.guild.get_member(int(member_id))
+            member = ctx.guild.get_member(member_id)
             name = member.mention if member else f"<@{member_id}>"
             rank = medals[position - 1] if position <= 3 else f"`#{position}`"
             description += f"{rank} {name} — **😭 {total:,}**\n"
@@ -162,25 +221,19 @@ class Sobs(commands.Cog):
     @sob.command(name="msg")
     async def sob_msg(self, ctx, member: discord.Member = None):
         member = member or ctx.author
-        bucket = self._bucket(ctx.guild.id)
-        their_messages = [
-            (mid, entry) for mid, entry in bucket["messages"].items()
-            if entry["author_id"] == member.id and entry["count"] > 0
-        ]
-        their_messages.sort(key=lambda x: x[1]["count"], reverse=True)
-        their_messages = their_messages[:10]
+        rows = self._top_messages(ctx.guild.id, member.id)
 
-        if not their_messages:
+        if not rows:
             await ctx.send(f"😭 **{member.display_name}** has no individually tracked sob messages yet.")
             return
 
         lines = []
-        for mid, entry in their_messages:
-            jump_url = f"https://discord.com/channels/{ctx.guild.id}/{entry['channel_id']}/{mid}"
-            snippet = entry["content"].replace("\n", " ").strip() or "*(no text — embed/attachment)*"
+        for message_id, channel_id, count, content in rows:
+            jump_url = f"https://discord.com/channels/{ctx.guild.id}/{channel_id}/{message_id}"
+            snippet = (content or "").replace("\n", " ").strip() or "*(no text — embed/attachment)*"
             if len(snippet) > 60:
                 snippet = snippet[:57] + "..."
-            lines.append(f"**😭 {entry['count']}** — [{snippet}]({jump_url})")
+            lines.append(f"**😭 {count}** — [{snippet}]({jump_url})")
 
         embed = discord.Embed(
             title=f"😭 Top Sob Messages — {member.display_name}",
