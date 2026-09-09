@@ -26,6 +26,22 @@ class Sobs(commands.Cog):
         self.db.execute(
             "CREATE INDEX IF NOT EXISTS idx_sob_author ON sob_messages (guild_id, author_id)"
         )
+        # Holds the most recent reset's data per member, so it can be undone
+        # with ,revert. Only the latest reset per person is recoverable —
+        # a second reset before reverting overwrites this backup.
+        self.db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sob_backup (
+                guild_id    INTEGER NOT NULL,
+                message_id  INTEGER NOT NULL,
+                author_id   INTEGER NOT NULL,
+                channel_id  INTEGER NOT NULL,
+                count       INTEGER NOT NULL,
+                content     TEXT,
+                PRIMARY KEY (guild_id, message_id)
+            )
+            """
+        )
         self.db.commit()
 
     # -- helpers -----------------------------------------------------
@@ -88,6 +104,63 @@ class Sobs(commands.Cog):
             (guild_id, author_id, limit),
         )
         return cur.fetchall()
+
+    def _reset_member(self, guild_id, member_id):
+        cur = self.db.cursor()
+        cur.execute(
+            "SELECT message_id, channel_id, count, content FROM sob_messages "
+            "WHERE guild_id=? AND author_id=?",
+            (guild_id, member_id),
+        )
+        rows = cur.fetchall()
+
+        if not rows:
+            return False  # nothing to reset
+
+        # Clear any older backup for this person first — only one backup
+        # (the most recent reset) is ever kept per member.
+        self.db.execute(
+            "DELETE FROM sob_backup WHERE guild_id=? AND author_id=?",
+            (guild_id, member_id),
+        )
+        for message_id, channel_id, count, content in rows:
+            self.db.execute(
+                "INSERT INTO sob_backup (guild_id, message_id, author_id, channel_id, count, content) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (guild_id, message_id, member_id, channel_id, count, content),
+            )
+        self.db.execute(
+            "DELETE FROM sob_messages WHERE guild_id=? AND author_id=?",
+            (guild_id, member_id),
+        )
+        self.db.commit()
+        return True
+
+    def _revert_member(self, guild_id, member_id):
+        cur = self.db.cursor()
+        cur.execute(
+            "SELECT message_id, channel_id, count, content FROM sob_backup "
+            "WHERE guild_id=? AND author_id=?",
+            (guild_id, member_id),
+        )
+        rows = cur.fetchall()
+
+        if not rows:
+            return False  # nothing to revert
+
+        for message_id, channel_id, count, content in rows:
+            self.db.execute(
+                "INSERT OR REPLACE INTO sob_messages "
+                "(guild_id, message_id, author_id, channel_id, count, content) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (guild_id, message_id, member_id, channel_id, count, content),
+            )
+        self.db.execute(
+            "DELETE FROM sob_backup WHERE guild_id=? AND author_id=?",
+            (guild_id, member_id),
+        )
+        self.db.commit()
+        return True
 
     async def _scan_guild(self, guild, status_callback=None):
         def _clear():
@@ -258,6 +331,50 @@ class Sobs(commands.Cog):
     async def sob_scan_error(self, ctx, error):
         if isinstance(error, commands.MissingPermissions):
             await ctx.send("You need administrator permissions to run a full scan.")
+        else:
+            raise error
+
+    @commands.command(name="reset")
+    @commands.has_permissions(administrator=True)
+    async def reset_sobs(self, ctx, member: discord.Member):
+        """Resets a member's sob count to 0. Their prior data is saved and
+        can be restored once with ,revert — but only the most recent
+        reset is recoverable."""
+        did_reset = self._reset_member(ctx.guild.id, member.id)
+        if not did_reset:
+            await ctx.send(f"**{member.display_name}** already has no sob count to reset.")
+            return
+        await ctx.send(
+            f"😭 Reset **{member.display_name}**'s sob count to 0. "
+            f"Use `,revert @{member.display_name}` to undo this."
+        )
+
+    @reset_sobs.error
+    async def reset_sobs_error(self, ctx, error):
+        if isinstance(error, commands.MissingPermissions):
+            await ctx.send("You need administrator permissions to reset someone's count.")
+        elif isinstance(error, commands.MemberNotFound):
+            await ctx.send("Couldn't find that member. Usage: `,reset @user`")
+        else:
+            raise error
+
+    @commands.command(name="revert")
+    @commands.has_permissions(administrator=True)
+    async def revert_sobs(self, ctx, member: discord.Member):
+        """Restores a member's sob count from their most recent ,reset."""
+        did_revert = self._revert_member(ctx.guild.id, member.id)
+        if not did_revert:
+            await ctx.send(f"There's no recent reset to revert for **{member.display_name}**.")
+            return
+        total = self._member_total(ctx.guild.id, member.id)
+        await ctx.send(f"😭 Restored **{member.display_name}**'s sob count to {total:,}.")
+
+    @revert_sobs.error
+    async def revert_sobs_error(self, ctx, error):
+        if isinstance(error, commands.MissingPermissions):
+            await ctx.send("You need administrator permissions to revert someone's count.")
+        elif isinstance(error, commands.MemberNotFound):
+            await ctx.send("Couldn't find that member. Usage: `,revert @user`")
         else:
             raise error
 
