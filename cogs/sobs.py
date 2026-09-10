@@ -96,6 +96,14 @@ class Sobs(commands.Cog):
         )
         return cur.fetchall()
 
+    def _server_total(self, guild_id):
+        cur = self.db.cursor()
+        cur.execute(
+            "SELECT COALESCE(SUM(count), 0) FROM sob_messages WHERE guild_id=?",
+            (guild_id,),
+        )
+        return cur.fetchone()[0]
+
     def _top_messages(self, guild_id, author_id, limit=10):
         cur = self.db.cursor()
         cur.execute(
@@ -252,13 +260,14 @@ class Sobs(commands.Cog):
         member = member or ctx.author
         total = self._member_total(ctx.guild.id, member.id)
 
-        embed = discord.Embed(
-            title="😭 Sob Counter",
-            description=f"**{member.mention}** has received\n\n# 😭 {total:,} sobs\n\non their messages.",
-            color=discord.Color.blurple(),
-        )
+        embed = discord.Embed(title="Sob stats", color=discord.Color.dark_grey())
+        embed.add_field(name="User", value=member.mention, inline=True)
+        embed.add_field(name="Total Sobs", value=f"`{total}` 😭", inline=True)
         embed.set_thumbnail(url=member.display_avatar.url)
-        embed.set_footer(text="Run `,sob scan` (admin) if this looks out of date.")
+        embed.set_footer(
+            text=f"Requested by {ctx.author} • try ,sob",
+            icon_url=ctx.author.display_avatar.url,
+        )
         await ctx.send(embed=embed)
 
     @commands.group(name="sob", invoke_without_command=True)
@@ -271,24 +280,60 @@ class Sobs(commands.Cog):
             "`,sob scan` — (admin) rebuild counts from full channel history"
         )
 
+
     @sob.command(name="leaderboard")
     async def sob_leaderboard(self, ctx):
         entries = self._leaderboard(ctx.guild.id)
 
         if not entries:
-            await ctx.send("😭 Nobody has received any sob reactions yet! Try `,sob scan` if this seems wrong.")
+            embed = discord.Embed(
+            title="😭 Sob Leaderboard",
+            description="No sobs yet 😭",
+            color=discord.Color.blurple(),
+            )
+            await ctx.send(embed=embed)
             return
 
-        medals = ["🥇", "🥈", "🥉"]
-        description = ""
+        medals = {
+            1: "🥇",
+            2: "🥈",
+            3: "🥉",
+        }
+
+        server_total = self._server_total(ctx.guild.id)
+
+        lines = []
+
         for position, (member_id, total) in enumerate(entries, start=1):
             member = ctx.guild.get_member(member_id)
-            name = member.mention if member else f"<@{member_id}>"
-            rank = medals[position - 1] if position <= 3 else f"`#{position}`"
-            description += f"{rank} {name} — **😭 {total:,}**\n"
 
-        embed = discord.Embed(title="😭 Sob Leaderboard", description=description, color=discord.Color.blurple())
-        embed.set_footer(text=f"Top {len(entries)} members • Highest → Lowest")
+            # Use an actual Discord mention so the username is clickable
+            if member:
+                username = member.mention
+            else:
+                username = f"<@{member_id}>"
+
+            prefix = medals.get(position, f"#{position}")
+
+            lines.append(
+                f"{prefix} {username} — 😭 **{total:,}**"
+            )
+
+        embed = discord.Embed(
+            title="😭 Sob Leaderboard",
+            description="\n".join(lines),
+            color=discord.Color.blurple(),
+        )
+
+        embed.set_footer(
+            text=f"Top {len(entries)} members • Highest → Lowest"
+        )
+
+        embed.set_author(
+            name=f"Server Total Sobs: {server_total}",
+            icon_url=ctx.guild.icon.url if ctx.guild.icon else None,
+        )
+
         await ctx.send(embed=embed)
 
     @sob.command(name="msg")
@@ -342,19 +387,26 @@ class Sobs(commands.Cog):
         reset is recoverable."""
         did_reset = self._reset_member(ctx.guild.id, member.id)
         if not did_reset:
-            await ctx.send(f"**{member.display_name}** already has no sob count to reset.")
+            await ctx.send(f"❌ **{member.display_name}** already has no sob count to reset.")
             return
-        await ctx.send(
-            f"😭 Reset **{member.display_name}**'s sob count to 0. "
-            f"Use `,revert @{member.display_name}` to undo this."
+
+        embed = discord.Embed(
+            title="Sobs Reset",
+            description=f"🧹 Reset sobs for **{member.display_name}**",
+            color=discord.Color.red(),
         )
+        embed.set_footer(
+            text=f"Requested by {ctx.author.display_name} • use ,revert @{member.display_name} to undo",
+            icon_url=ctx.author.display_avatar.url,
+        )
+        await ctx.send(embed=embed)
 
     @reset_sobs.error
     async def reset_sobs_error(self, ctx, error):
         if isinstance(error, commands.MissingPermissions):
-            await ctx.send("You need administrator permissions to reset someone's count.")
+            await ctx.send("❌ You need administrator permissions to reset someone's count.")
         elif isinstance(error, commands.MemberNotFound):
-            await ctx.send("Couldn't find that member. Usage: `,reset @user`")
+            await ctx.send("❌ Couldn't find that member. Usage: `,reset @user`")
         else:
             raise error
 
@@ -364,17 +416,25 @@ class Sobs(commands.Cog):
         """Restores a member's sob count from their most recent ,reset."""
         did_revert = self._revert_member(ctx.guild.id, member.id)
         if not did_revert:
-            await ctx.send(f"There's no recent reset to revert for **{member.display_name}**.")
+            await ctx.send(f"❌ There's no recent reset to revert for **{member.display_name}**.")
             return
+
         total = self._member_total(ctx.guild.id, member.id)
-        await ctx.send(f"😭 Restored **{member.display_name}**'s sob count to {total:,}.")
+        embed = discord.Embed(
+            title="😭 Sobs Restored",
+            description=f"Restored sobs for **{member.display_name}**",
+            color=discord.Color.green(),
+        )
+        embed.add_field(name="New Total", value=f"`{total}` sobs")
+        embed.set_thumbnail(url=member.display_avatar.url)
+        await ctx.send(embed=embed)
 
     @revert_sobs.error
     async def revert_sobs_error(self, ctx, error):
         if isinstance(error, commands.MissingPermissions):
-            await ctx.send("You need administrator permissions to revert someone's count.")
+            await ctx.send("❌ You need administrator permissions to revert someone's count.")
         elif isinstance(error, commands.MemberNotFound):
-            await ctx.send("Couldn't find that member. Usage: `,revert @user`")
+            await ctx.send("❌ Couldn't find that member. Usage: `,revert @user`")
         else:
             raise error
 
